@@ -4,6 +4,7 @@
 # by Claudio Santini 2025 - https://claudio.uk
 
 import argparse
+import os
 import sys
 import time
 import shutil
@@ -23,13 +24,33 @@ from pick import pick
 import onnxruntime as ort
 from tempfile import NamedTemporaryFile
 
+import torch
+
+from src.torch_inference.models import build_model as kt_build_model
+from src.torch_inference.kokoro import generate as kt_generate
+from src.torch_inference.kokoro import generate_full as kt_generate_full
+
 MODEL_FILE = 'kokoro-v0_19.onnx'
 VOICES_FILE = 'voices.json'
 config.MAX_PHONEME_LENGTH = 128
 
 
 def main(kokoro, file_path, lang, voice, pick_manually, speed, providers):
+    
+
+    
     # Set ONNX providers if specified
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    MODEL = kt_build_model('kokoro-v0_19.pth', device)
+    VOICE_NAME = [
+    'af', # Default voice is a 50-50 mix of Bella & Sarah
+    'af_bella', 'af_sarah', 'am_adam', 'am_michael',
+    'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis',
+    'af_nicole', 'af_sky',
+    ][0]
+    VOICEPACK = torch.load(f'voices/{VOICE_NAME}.pt', weights_only=True).to(device)
+    print(f'Loaded voice: {VOICE_NAME}')
     if providers:
         available_providers = ort.get_available_providers()
         invalid_providers = [p for p in providers if p not in available_providers]
@@ -37,7 +58,7 @@ def main(kokoro, file_path, lang, voice, pick_manually, speed, providers):
             print(f"Invalid ONNX providers: {', '.join(invalid_providers)}")
             print(f"Available providers: {', '.join(available_providers)}")
             sys.exit(1)
-        kokoro.sess.set_providers(providers)
+        # kokoro.sess.set_providers(providers)
         print(f"Using ONNX providers: {', '.join(providers)}")
     filename = Path(file_path).name
     warnings.simplefilter("ignore")
@@ -88,7 +109,15 @@ def main(kokoro, file_path, lang, voice, pick_manually, speed, providers):
         if i == 1:
             text = intro + '.\n\n' + text
         start_time = time.time()
-        samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang=lang)
+        
+        # This is the code to replace
+        #samples, sample_rate = kokoro.create(text, voice=voice, speed=speed, lang=lang)
+        sample_rate = 24000
+        #def generate(model, text, voicepack, lang='a', speed=1, ps=None):
+        samples, ps = kt_generate_full(
+            model=MODEL, text=text, voicepack=VOICEPACK
+        )
+        
         sf.write(f'{chapter_filename}', samples, sample_rate)
         durations[chapter_filename] = len(samples) / sample_rate
         end_time = time.time()
@@ -226,17 +255,18 @@ def create_index_file(title, creator, chapter_mp3_files, durations):
 
 
 def cli_main():
-    if not Path(MODEL_FILE).exists() or not Path(VOICES_FILE).exists():
-        print('Error: kokoro-v0_19.onnx and voices.json must be in the current directory. Please download them with:')
-        print('wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx')
-        print('wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.json')
-        sys.exit(1)
-    kokoro = Kokoro(MODEL_FILE, VOICES_FILE)
-    voices = list(kokoro.get_voices())
-    voices_str = ', '.join(voices)
+    # if not Path(MODEL_FILE).exists() or not Path(VOICES_FILE).exists():
+    #     print('Error: kokoro-v0_19.onnx and voices.json must be in the current directory. Please download them with:')
+    #     print('wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/kokoro-v0_19.onnx')
+    #     print('wget https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files/voices.json')
+    #     sys.exit(1)
+    #kokoro = Kokoro(MODEL_FILE, VOICES_FILE)
+    kokoro = None
+    #voices = list(kokoro.get_voices())
+    #voices_str = ', '.join(voices)
     epilog = 'example:\n' + \
              '  audiblez book.epub -l en-us -v af_sky'
-    default_voice = 'af_sky' if 'af_sky' in voices else voices[0]
+    default_voice = 'af_sky' #if 'af_sky' in voices else voices[0]
 
     # Get available ONNX providers
     available_providers = ort.get_available_providers()
@@ -245,7 +275,7 @@ def cli_main():
     parser = argparse.ArgumentParser(epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('epub_file_path', help='Path to the epub file')
     parser.add_argument('-l', '--lang', default='en-gb', help='Language code: en-gb, en-us, fr-fr, ja, ko, cmn')
-    parser.add_argument('-v', '--voice', default=default_voice, help=f'Choose narrating voice: {voices_str}')
+    parser.add_argument('-v', '--voice', default=default_voice, help=f'Choose narrating voice: voices_str')
     parser.add_argument('-p', '--pick', default=False, help=f'Interactively select which chapters to read in the audiobook',
                         action='store_true')
     parser.add_argument('-s', '--speed', default=1.0, help=f'Set speed from 0.5 to 2.0', type=float)
@@ -259,4 +289,6 @@ def cli_main():
 
 
 if __name__ == '__main__':
+    os.environ["PHONEMIZER_ESPEAK_LIBRARY"] = r"C:\Program Files\eSpeak NG\libespeak-ng.dll"
+    os.environ["PHONEMIZER_ESPEAK_PATH"] = r"C:\Program Files\eSpeak NG\espeak-ng.exe"
     cli_main()
