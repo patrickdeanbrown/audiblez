@@ -43,12 +43,13 @@ def main(kokoro, file_path, lang, voice, pick_manually, speed, providers):
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     MODEL = kt_build_model('kokoro-v0_19.pth', device)
-    VOICE_NAME = [
-    'af', # Default voice is a 50-50 mix of Bella & Sarah
-    'af_bella', 'af_sarah', 'am_adam', 'am_michael',
-    'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis',
-    'af_nicole', 'af_sky',
-    ][0]
+    VOICE_NAME = 'af_sky'
+    # [
+    # 'af', # Default voice is a 50-50 mix of Bella & Sarah
+    # 'af_bella', 'af_sarah', 'am_adam', 'am_michael',
+    # 'bf_emma', 'bf_isabella', 'bm_george', 'bm_lewis',
+    # 'af_nicole', 'af_sky',
+    # ][0]
     VOICEPACK = torch.load(f'voices/{VOICE_NAME}.pt', weights_only=True).to(device)
     print(f'Loaded voice: {VOICE_NAME}')
     if providers:
@@ -208,11 +209,18 @@ def create_m4b(chapter_files, filename, title, author, cover_image):
     print('Creating M4B file...')
 
     if cover_image:
-        cover_image_file = NamedTemporaryFile("wb")
-        cover_image_file.write(cover_image)
-        cover_image_args = ["-i", cover_image_file.name, "-map", "0:a", "-map", "2:v"]
+        # Create the temporary file but don't lock it
+        cover_image_file = NamedTemporaryFile("wb", delete=False)
+        try:
+            cover_image_file.write(cover_image)
+            cover_image_file.close()  # Explicitly close to release the file lock on Windows
+            cover_image_args = ["-i", cover_image_file.name, "-map", "0:a", "-map", "2:v"]
+        finally:
+            # Ensure the file is deleted after FFmpeg finishes
+            cover_image_path = cover_image_file.name
     else:
         cover_image_args = []
+        cover_image_path = None
 
     proc = subprocess.run([
         'ffmpeg',
@@ -228,7 +236,12 @@ def create_m4b(chapter_files, filename, title, author, cover_image):
         '-f', 'mp4',
         f'{final_filename}'
     ])
+
+    # Clean up temporary files
     Path(tmp_filename).unlink()
+    if cover_image_path:
+        Path(cover_image_path).unlink()
+
     if proc.returncode == 0:
         print(f'{final_filename} created. Enjoy your audiobook.')
         print('Feel free to delete the intermediary .wav chapter files, the .m4b is all you need.')
