@@ -2,6 +2,7 @@ import phonemizer
 import re
 import torch
 import os
+import librosa
 import numpy as np
 
 def split_num(num):
@@ -114,30 +115,152 @@ def length_to_mask(lengths):
     mask = torch.gt(mask+1, lengths.unsqueeze(1))
     return mask
 
+
+# @torch.no_grad()
+# def forward(model, tokens, ref_s, speed):
+#     device = ref_s.device
+
+#     # Create tokens directly on the GPU; single-batch assumption
+#     # (adding 0 as start and end tokens)
+#     tokens = torch.tensor([[0] + list(tokens) + [0]],
+#                           dtype=torch.long,
+#                           device=device)
+#     input_lengths = torch.tensor([tokens.shape[-1]],
+#                                  dtype=torch.long,
+#                                  device=device)
+
+#     # Create text mask directly on the GPU
+#     text_mask = (torch.arange(input_lengths.item(), device=device)[None, :]
+#                  < input_lengths.unsqueeze(-1))  # boolean mask, shape [1, seq_len]
+
+#     # BERT duration prediction
+#     bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+#     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+
+#     # Reference frames: skip first 128
+#     s = ref_s[:, 128:]
+#     # Text encoder
+#     d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+#     x, _ = model.predictor.lstm(d)
+
+#     # Compute duration
+#     duration = model.predictor.duration_proj(x)
+#     duration = torch.sigmoid(duration).sum(dim=-1) / speed
+#     pred_dur = torch.round(duration).clamp(min=1).long()  # shape: [1, seq_len]
+
+#     # Construct alignment targets via loop
+#     # Ensure input_lengths is a Python int, not a tensor
+#     pred_aln_trg = torch.zeros(
+#         (input_lengths.item(), pred_dur.sum().item()),
+#         device=device,
+#         dtype=torch.float32
+#     )
+
+#     c_frame = 0
+#     for i in range(pred_aln_trg.size(0)):
+#         pred_aln_trg[i, c_frame : c_frame + pred_dur[0, i].item()] = 1
+#         c_frame += pred_dur[0, i].item()
+
+#     # Apply alignment to text encoder output
+#     en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0)  # shape [1, hidden_dim, total_frames]
+
+#     # Pitch / additional features
+#     F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+
+#     # Text encoder (ASR path)
+#     t_en = model.text_encoder(tokens, input_lengths, text_mask)
+#     asr = t_en @ pred_aln_trg.unsqueeze(0)  # shape [1, hidden_dim, total_frames]
+
+#     # Decoder
+#     output = model.decoder(asr, F0_pred, N_pred, ref_s[:, :128])
+
+#     return output.squeeze().cpu().numpy()
+
 @torch.no_grad()
 def forward(model, tokens, ref_s, speed):
     device = ref_s.device
-    tokens = torch.LongTensor([[0, *tokens, 0]]).to(device)
-    input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)
-    text_mask = length_to_mask(input_lengths).to(device)
-    bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
-    d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
-    s = ref_s[:, 128:]
-    d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
-    x, _ = model.predictor.lstm(d)
-    duration = model.predictor.duration_proj(x)
-    duration = torch.sigmoid(duration).sum(axis=-1) / speed
-    pred_dur = torch.round(duration).clamp(min=1).long()
-    pred_aln_trg = torch.zeros(input_lengths, pred_dur.sum().item())
-    c_frame = 0
-    for i in range(pred_aln_trg.size(0)):
-        pred_aln_trg[i, c_frame:c_frame + pred_dur[0,i].item()] = 1
-        c_frame += pred_dur[0,i].item()
-    en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device)
-    F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
-    t_en = model.text_encoder(tokens, input_lengths, text_mask)
-    asr = t_en @ pred_aln_trg.unsqueeze(0).to(device)
-    return model.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze().cpu().numpy()
+
+    with torch.amp.autocast('cuda'):
+        tokens = torch.tensor([[0] + list(tokens) + [0]], 
+                              dtype=torch.long, 
+                              device=device)
+        input_lengths = torch.tensor([tokens.shape[-1]], 
+                                     dtype=torch.long, 
+                                     device=device)
+
+        # Create the text mask directly on the GPU, reproducing the original helper logic:
+        # This mask is True for positions beyond the sequence length, and False otherwise.
+        max_len = input_lengths.max()
+        row_vector = torch.arange(max_len, device=device)               # [max_len]
+        row_vector = row_vector.unsqueeze(0).expand(input_lengths.size(0), max_len)  
+        text_mask = (row_vector + 1) > input_lengths.unsqueeze(1)       # shape [batch, max_len]
+
+        # Forward pass
+        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+
+        s = ref_s[:, 128:]
+        d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+        x, _ = model.predictor.lstm(d)
+
+        duration = model.predictor.duration_proj(x)
+        duration = torch.sigmoid(duration).sum(dim=-1) / speed
+        pred_dur = torch.round(duration).clamp(min=1).long()
+
+        # Revert to the loop-based alignment creation for reliability
+        pred_aln_trg = torch.zeros(
+            (input_lengths, pred_dur.sum().item()),
+            device=device,
+            dtype=torch.float32
+        )
+        c_frame = 0
+        for i in range(pred_aln_trg.size(0)):
+            pred_aln_trg[i, c_frame : c_frame + pred_dur[0, i].item()] = 1
+            c_frame += pred_dur[0, i].item()
+
+        en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0)
+        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+        t_en = model.text_encoder(tokens, input_lengths, text_mask)
+        asr = t_en @ pred_aln_trg.unsqueeze(0)
+        output = model.decoder(asr, F0_pred, N_pred, ref_s[:, :128])
+
+    return output.squeeze().cpu().numpy()
+
+
+# Original
+# @torch.no_grad()
+# def forward(model, tokens, ref_s, speed):
+#     device = ref_s.device
+#     # tokens = torch.LongTensor([[0, *tokens, 0]]).to(device)
+#     tokens = torch.tensor([[0] + list(tokens) + [0]],
+#                           dtype=torch.long,
+#                           device=device)
+#     input_lengths = torch.tensor([tokens.shape[-1]],
+#                                  dtype=torch.long,
+#                                  device=device)
+#     text_mask = length_to_mask(input_lengths).to(device)
+
+#     # Creates garbled output
+#     text_mask = (torch.arange(input_lengths.item(), device=device)[None, :]
+#                  < input_lengths.unsqueeze(-1))  # boolean mask, shape [1, seq_len]
+#     bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
+#     d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+#     s = ref_s[:, 128:]
+#     d = model.predictor.text_encoder(d_en, s, input_lengths, text_mask)
+#     x, _ = model.predictor.lstm(d)
+#     duration = model.predictor.duration_proj(x)
+#     duration = torch.sigmoid(duration).sum(axis=-1) / speed
+#     pred_dur = torch.round(duration).clamp(min=1).long()
+#     pred_aln_trg = torch.zeros(input_lengths, pred_dur.sum().item())
+#     c_frame = 0
+#     for i in range(pred_aln_trg.size(0)):
+#         pred_aln_trg[i, c_frame:c_frame + pred_dur[0,i].item()] = 1
+#         c_frame += pred_dur[0,i].item()
+#     en = d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device)
+#     F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+#     t_en = model.text_encoder(tokens, input_lengths, text_mask)
+#     asr = t_en @ pred_aln_trg.unsqueeze(0).to(device)
+#     return model.decoder(asr, F0_pred, N_pred, ref_s[:, :128]).squeeze().cpu().numpy()
 
 
 def generate(model, text, voicepack, lang='a', speed=1, ps=None):
@@ -163,6 +286,7 @@ def generate_full(model, text, voicepack, lang='a', speed=1, ps=None):
     for i in range(loop_count):
         ref_s = voicepack[len(tokens[i*510:(i+1)*510])]
         out = forward(model, tokens[i*510:(i+1)*510], ref_s, speed)
+        out, _ = librosa.effects.trim(out)
         outs.append(out)
     outs = np.concatenate(outs)
     ps = ''.join(next(k for k, v in VOCAB.items() if i == v) for i in tokens)

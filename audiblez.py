@@ -42,7 +42,7 @@ def main(kokoro, file_path, lang, voice, pick_manually, speed, providers):
     # Set ONNX providers if specified
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    MODEL = kt_build_model('kokoro-v0_19.pth', device)
+    MODEL = kt_build_model('kokoro-v0_19-half.pth', device)
     VOICE_NAME = 'af_sky'
     # [
     # 'af', # Default voice is a 50-50 mix of Bella & Sarah
